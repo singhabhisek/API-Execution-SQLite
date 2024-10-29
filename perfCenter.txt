@@ -1,0 +1,135 @@
+import os
+import pyodbc
+import sqlite3
+from datetime import datetime
+from microfocus.perfcenter import PerfCenter
+
+def download_results_with_perf_center(host, domain, project, login, password, run_id, output_dir='output'):
+    # Authenticate and download results using PerfCenter API
+    wp_pc_client = PerfCenter(host=host, domain=domain, project=project)
+    wp_pc_client.authenticate(login=login, password=password)
+
+    # Define the files to download
+    files = {f'Results_{run_id}.zip'}  # Change or add more files if needed
+
+    # Get run information to determine the folder structure
+    run_info = wp_pc_client.get_test_run_status_extended(run_id=run_id).json()
+    test_run_date = run_info['StartTime'].split(' ')[0]
+    test_run_path = os.path.join(output_dir, f'{test_run_date}_Run{run_id}')
+
+    # Create directory if it doesn't exist
+    if not os.path.exists(test_run_path):
+        os.makedirs(test_run_path)
+
+    # Download the results
+    wp_pc_client.download_lr_results(run_id=run_id, files=files, dst=test_run_path)
+    
+    wp_pc_client.logout()
+
+    # Find the downloaded .mdb file
+    mdb_file_path = None
+    for root, _, files in os.walk(test_run_path):
+        for file in files:
+            if file.endswith(".mdb"):
+                mdb_file_path = os.path.join(root, file)
+                break
+    return mdb_file_path
+
+def calculate_metrics_from_mdb(mdb_file_path):
+    # Connect to the MDB using pyodbc
+    connection_string = r"Driver={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" + mdb_file_path + ";"
+    conn = pyodbc.connect(connection_string, autocommit=True)
+    cursor = conn.cursor()
+    
+    # Fetch transaction data assuming a table named 'Transactions' exists
+    query = "SELECT TransactionName, ResponseTime FROM Transactions"
+    cursor.execute(query)
+    
+    # Aggregate data
+    transactions = {}
+    for row in cursor.fetchall():
+        transaction_name, response_time = row
+        if transaction_name not in transactions:
+            transactions[transaction_name] = []
+        transactions[transaction_name].append(response_time)
+    
+    conn.close()
+
+    # Calculate average and 90th percentile for each transaction
+    metrics = []
+    for transaction_name, response_times in transactions.items():
+        avg_time = sum(response_times) / len(response_times)
+        p90_time = sorted(response_times)[int(len(response_times) * 0.9) - 1]
+        metrics.append((transaction_name, avg_time, p90_time))
+    
+    return metrics
+
+def insert_into_sqlite(application, release_id, run_id, date_of_execution, metrics, created_by, comments):
+    # Store results into an SQLite database
+    conn = sqlite3.connect('performance_center_results.db')
+    cursor = conn.cursor()
+    
+    # Create table if not exists
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS performance_center_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_name TEXT,
+            release_id TEXT,
+            run_id TEXT,
+            date_of_execution TEXT,
+            transaction_name TEXT,
+            average_response_time REAL,
+            p90_response_time REAL,
+            comments TEXT,
+            created_by TEXT,
+            created_on TEXT
+        )
+    ''')
+    
+    created_on = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Insert metrics into the table
+    for transaction_name, avg_time, p90_time in metrics:
+        cursor.execute('''
+            INSERT INTO performance_center_results (
+                application_name, release_id, run_id, date_of_execution, transaction_name,
+                average_response_time, p90_response_time, comments, created_by, created_on
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (application, release_id, run_id, date_of_execution, transaction_name, avg_time, p90_time, comments, created_by, created_on))
+    
+    conn.commit()
+    conn.close()
+
+def main():
+    # User-provided inputs
+    application = input("Enter the application name: ")
+    release_id = input("Enter the release ID: ")
+    run_id = input("Enter the performance center run ID: ")
+    date_of_execution = input("Enter the date of execution (YYYY-MM-DD): ")
+    created_by = input("Enter your name: ")
+    comments = input("Enter any comments: ")
+    
+    # API credentials and details
+    host = "HOST"  # Replace with actual host
+    domain = "COMPANY"  # Replace with actual domain
+    project = "PROJECT"  # Replace with actual project
+    login = "tester"  # Replace with actual login
+    password = "tester"  # Replace with actual password
+
+    # Download and extract MDB file using PerfCenter
+    mdb_file_path = download_results_with_perf_center(host, domain, project, login, password, run_id)
+    
+    if mdb_file_path:
+        # Calculate metrics
+        metrics = calculate_metrics_from_mdb(mdb_file_path)
+        
+        # Insert into SQLite
+        insert_into_sqlite(application, release_id, run_id, date_of_execution, metrics, created_by, comments)
+        
+        print("Data inserted successfully into SQLite!")
+    else:
+        print("Failed to download and process results.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
