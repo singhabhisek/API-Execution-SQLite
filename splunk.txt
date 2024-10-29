@@ -1,0 +1,153 @@
+import requests
+import json
+import sqlite3
+from datetime import datetime
+import time
+
+def splunk_login(splunk_url, username, password):
+    """
+    Authenticate with Splunk and obtain a session key.
+    """
+    login_data = {
+        'username': username,
+        'password': password,
+        'output_mode': 'json'
+    }
+    
+    response = requests.post(f"{splunk_url}/services/auth/login", data=login_data, verify=False)
+    
+    if response.status_code == 200:
+        session_key = response.json()['sessionKey']
+        print("Successfully authenticated with Splunk.")
+        return session_key
+    else:
+        print(f"Error during login: {response.status_code} - {response.text}")
+        return None
+
+def start_splunk_search(splunk_url, session_key, search_query, earliest_time, latest_time):
+    """
+    Start a search job in Splunk.
+    """
+    headers = {
+        'Authorization': f'Splunk {session_key}'
+    }
+    
+    search_data = {
+        'search': search_query,
+        'earliest_time': earliest_time,
+        'latest_time': latest_time,
+        'output_mode': 'json'
+    }
+    
+    response = requests.post(f"{splunk_url}/services/search/jobs", headers=headers, data=search_data, verify=False)
+    
+    if response.status_code == 201:
+        job_id = response.json()['sid']
+        print(f"Search job started successfully with Job ID: {job_id}")
+        return job_id
+    else:
+        print(f"Error starting search job: {response.status_code} - {response.text}")
+        return None
+
+def get_splunk_search_results(splunk_url, session_key, job_id):
+    """
+    Fetch search results from Splunk.
+    """
+    headers = {
+        'Authorization': f'Splunk {session_key}'
+    }
+    
+    # Check if the job is done
+    job_status = None
+    while job_status != 'DONE':
+        job_status_response = requests.get(f"{splunk_url}/services/search/jobs/{job_id}", headers=headers, verify=False)
+        if job_status_response.status_code == 200:
+            job_status = job_status_response.json()['entry'][0]['content']['dispatchState']
+            if job_status != 'DONE':
+                print("Waiting for job completion...")
+                time.sleep(5)  # Poll every 5 seconds
+        else:
+            print(f"Error fetching job status: {job_status_response.status_code} - {job_status_response.text}")
+            return None
+    
+    # Fetch the results
+    results_response = requests.get(f"{splunk_url}/services/search/jobs/{job_id}/results", headers=headers, params={'output_mode': 'json'}, verify=False)
+    
+    if results_response.status_code == 200:
+        return results_response.json().get('results', [])
+    else:
+        print(f"Error fetching search results: {results_response.status_code} - {results_response.text}")
+        return []
+
+def insert_splunk_data_to_sqlite(data, application_name, release_id, run_id, date_of_execution):
+    """
+    Insert Splunk data into an SQLite database.
+    """
+    conn = sqlite3.connect('splunk_results.db')
+    cursor = conn.cursor()
+
+    # Create the table if not exists
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS splunk_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_name TEXT,
+            release_id TEXT,
+            run_id TEXT,
+            date_of_execution TEXT,
+            raw_data TEXT
+        )
+    ''')
+
+    # Insert each record into the SQLite table
+    for record in data:
+        cursor.execute('''
+            INSERT INTO splunk_results (
+                application_name, release_id, run_id, date_of_execution, raw_data
+            ) VALUES (?, ?, ?, ?, ?)
+        ''', (application_name, release_id, run_id, date_of_execution, json.dumps(record)))
+    
+    conn.commit()
+    conn.close()
+
+def main():
+    # User-provided inputs
+    application_name = input("Enter the application name: ")
+    release_id = input("Enter the release ID: ")
+    run_id = input("Enter the run ID: ")
+    date_of_execution = input("Enter the date of execution (YYYY-MM-DD): ")
+    
+    # Splunk details
+    splunk_url = "https://your-splunk-url:8089"  # Replace with your Splunk URL
+    username = "your_username"
+    password = "your_password"
+    
+    # Splunk search query details
+    search_query = 'search index="your_index" sourcetype="your_sourcetype" host="your_server"'
+    earliest_time = "-1h"  # Example: Fetch data from the last hour (change as needed)
+    latest_time = "now"
+    
+    # Authenticate with Splunk and get a session key
+    session_key = splunk_login(splunk_url, username, password)
+    
+    if session_key:
+        # Start a search job
+        job_id = start_splunk_search(splunk_url, session_key, search_query, earliest_time, latest_time)
+        
+        if job_id:
+            # Fetch search results
+            results = get_splunk_search_results(splunk_url, session_key, job_id)
+            
+            if results:
+                # Insert data into SQLite
+                insert_splunk_data_to_sqlite(results, application_name, release_id, run_id, date_of_execution)
+                print("Data inserted successfully into SQLite!")
+            else:
+                print("No data to insert.")
+        else:
+            print("Failed to start the search job.")
+    else:
+        print("Failed to authenticate with Splunk.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
