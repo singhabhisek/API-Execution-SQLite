@@ -1,0 +1,119 @@
+import requests
+import sqlite3
+from datetime import datetime
+
+def fetch_dynatrace_data(api_url, api_token, metric_selector, resolution, start_time, end_time, entity_selector):
+    """
+    Fetch CPU and Memory data from Dynatrace REST API.
+    
+    Parameters:
+        api_url (str): The base URL for Dynatrace API.
+        api_token (str): Dynatrace API Token for authentication.
+        metric_selector (str): Metric selector (e.g., CPU usage, memory usage).
+        resolution (str): Resolution for data granularity (e.g., '1m' for 1 minute).
+        start_time (str): Start time in Dynatrace API-compatible format.
+        end_time (str): End time in Dynatrace API-compatible format.
+        entity_selector (str): Entity selector to filter the data (e.g., server IDs).
+
+    Returns:
+        list: List of raw data records fetched from Dynatrace API.
+    """
+    headers = {
+        'Authorization': f'Api-Token {api_token}'
+    }
+
+    params = {
+        'metricSelector': metric_selector,
+        'resolution': resolution,
+        'from': start_time,
+        'to': end_time,
+        'entitySelector': entity_selector
+    }
+
+    response = requests.get(f"{api_url}/metrics/query", headers=headers, params=params)
+    
+    if response.status_code == 200:
+        return response.json().get('result', [])
+    else:
+        print(f"Error: {response.status_code} - {response.text}")
+        return []
+
+def insert_dynatrace_data_to_sqlite(data, application_name, release_id, run_id, date_of_execution):
+    """
+    Insert Dynatrace CPU and Memory data into an SQLite database.
+    
+    Parameters:
+        data (list): List of raw data records fetched from Dynatrace API.
+        application_name (str): The name of the application.
+        release_id (str): The release ID.
+        run_id (str): The run ID.
+        date_of_execution (str): The execution date.
+    """
+    conn = sqlite3.connect('dynatrace_results.db')
+    cursor = conn.cursor()
+
+    # Create the table if not exists
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS dynatrace_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_name TEXT,
+            release_id TEXT,
+            run_id TEXT,
+            date_of_execution TEXT,
+            metric TEXT,
+            timestamp TEXT,
+            value REAL
+        )
+    ''')
+    
+    # Insert each record into the SQLite table
+    for metric_data in data:
+        metric_name = metric_data['metricId']
+        for series in metric_data['data']:
+            for point in series['values']:
+                if point[0] is not None:  # Avoid null values
+                    cursor.execute('''
+                        INSERT INTO dynatrace_results (
+                            application_name, release_id, run_id, date_of_execution,
+                            metric, timestamp, value
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (application_name, release_id, run_id, date_of_execution, 
+                          metric_name, datetime.utcfromtimestamp(point[0] / 1000).strftime('%Y-%m-%d %H:%M:%S'), 
+                          point[1]))
+    
+    conn.commit()
+    conn.close()
+
+def main():
+    # User-provided inputs
+    application_name = input("Enter the application name: ")
+    release_id = input("Enter the release ID: ")
+    run_id = input("Enter the run ID: ")
+    date_of_execution = input("Enter the date of execution (YYYY-MM-DD): ")
+
+    # API and query details
+    api_url = "https://your-domain/e/your-environment-id/api/v2"
+    api_token = "YOUR_API_TOKEN"
+    
+    # Define your metric selectors and entity filters as required
+    metrics = ["builtin:host.cpu.usage", "builtin:host.mem.usage"]
+    resolution = "1m"
+    start_time = "now-1h"  # Fetch data from 1 hour ago (e.g., change as needed)
+    end_time = "now"
+    entity_selector = 'type("HOST")'  # Filter based on your needs, e.g., server IDs or host names
+    
+    all_data = []
+
+    for metric in metrics:
+        metric_data = fetch_dynatrace_data(api_url, api_token, metric, resolution, start_time, end_time, entity_selector)
+        all_data.extend(metric_data)
+
+    if all_data:
+        insert_dynatrace_data_to_sqlite(all_data, application_name, release_id, run_id, date_of_execution)
+        print("Data inserted successfully into SQLite!")
+    else:
+        print("No data to insert.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()
