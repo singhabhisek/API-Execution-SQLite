@@ -1,0 +1,180 @@
+import os
+import requests
+import json
+import sqlite3
+import time
+from datetime import datetime
+from base64 import b64encode
+
+# ============================
+# LoadRunner Enterprise (LRE) Section
+# ============================
+
+class LREClient:
+    def __init__(self, host, domain, project, username, password):
+        self.host = host
+        self.domain = domain
+        self.project = project
+        self.project_rest_api = f"{self.host}/LoadTest/rest/domains/{self.domain}/projects/{self.project}"
+        self.session = requests.Session()
+        self.auth_token = b64encode(f"{username}:{password}".encode("unicode_escape")).decode("utf-8")
+        self.session.headers.update({
+            'Authorization': f'Basic {self.auth_token}',
+            'Accept': 'application/json',
+        })
+    
+    def authenticate(self):
+        response = self.session.get(url=f'{self.host}/LoadTest/rest/authentication-point/authenticate')
+        return response.ok
+
+    def download_results(self, run_id, files, destination):
+        # Download files for a given run ID
+        for file_name in files:
+            print(f"Downloading {file_name} ...")
+            # Logic for downloading results similar to the initial LRE script.
+
+# ============================
+# Dynatrace Section
+# ============================
+
+def fetch_dynatrace_metrics(dt_url, api_token, metric_selector, entity_selector, resolution, start_time, end_time):
+    headers = {
+        'Authorization': f'Api-Token {api_token}'
+    }
+    params = {
+        'metricSelector': metric_selector,
+        'resolution': resolution,
+        'from': start_time,
+        'to': end_time,
+        'entitySelector': entity_selector
+    }
+    
+    response = requests.get(f"{dt_url}/api/v2/metrics/query", headers=headers, params=params)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error fetching Dynatrace metrics: {response.status_code} - {response.text}")
+        return None
+
+# ============================
+# Splunk Section
+# ============================
+
+def splunk_login(splunk_url, username, password):
+    login_data = {
+        'username': username,
+        'password': password,
+        'output_mode': 'json'
+    }
+    response = requests.post(f"{splunk_url}/services/auth/login", data=login_data, verify=False)
+    if response.status_code == 200:
+        return response.json()['sessionKey']
+    else:
+        print(f"Error during login: {response.status_code} - {response.text}")
+        return None
+
+def start_splunk_search(splunk_url, session_key, search_query, earliest_time, latest_time):
+    headers = {'Authorization': f'Splunk {session_key}'}
+    search_data = {
+        'search': search_query,
+        'earliest_time': earliest_time,
+        'latest_time': latest_time,
+        'output_mode': 'json'
+    }
+    response = requests.post(f"{splunk_url}/services/search/jobs", headers=headers, data=search_data, verify=False)
+    if response.status_code == 201:
+        return response.json()['sid']
+    else:
+        return None
+
+def get_splunk_search_results(splunk_url, session_key, job_id):
+    headers = {'Authorization': f'Splunk {session_key}'}
+    # Poll for job status and fetch results similarly to the initial Splunk script.
+
+# ============================
+# Database Section
+# ============================
+
+def insert_data_to_sqlite(table_name, data, application_name, release_id, run_id, date_of_execution):
+    conn = sqlite3.connect('performance_results.db')
+    cursor = conn.cursor()
+
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_name TEXT,
+            release_id TEXT,
+            run_id TEXT,
+            date_of_execution TEXT,
+            raw_data TEXT
+        )
+    ''')
+
+    for record in data:
+        cursor.execute(f'''
+            INSERT INTO {table_name} (
+                application_name, release_id, run_id, date_of_execution, raw_data
+            ) VALUES (?, ?, ?, ?, ?)
+        ''', (application_name, release_id, run_id, date_of_execution, json.dumps(record)))
+
+    conn.commit()
+    conn.close()
+
+# ============================
+# Main Function
+# ============================
+
+def main():
+    # Common metadata
+    application_name = "MyApplication"
+    release_id = "v1.0"
+    run_id = "12345"
+    date_of_execution = datetime.now().strftime('%Y-%m-%d')
+
+    # ============================
+    # LRE Section
+    # ============================
+    lre_client = LREClient(host="https://lre-host", domain="mydomain", project="myproject", username="user", password="pass")
+    if lre_client.authenticate():
+        lre_files = {'Results.zip'}  # Example of files to download
+        lre_client.download_results(run_id="2099", files=lre_files, destination="./lre_results")
+        insert_data_to_sqlite("lre_results", [{"file": "Results.zip"}], application_name, release_id, run_id, date_of_execution)
+
+    # ============================
+    # Dynatrace Section
+    # ============================
+    dt_url = "https://my-dynatrace-url"
+    dt_api_token = "my-api-token"
+    metric_data = fetch_dynatrace_metrics(
+        dt_url, dt_api_token, 
+        metric_selector="builtin:host.cpu.usage", 
+        entity_selector='type("HOST")', 
+        resolution="1m", 
+        start_time="now-1h", 
+        end_time="now"
+    )
+    if metric_data:
+        insert_data_to_sqlite("dynatrace_results", metric_data['result'], application_name, release_id, run_id, date_of_execution)
+
+    # ============================
+    # Splunk Section
+    # ============================
+    splunk_url = "https://my-splunk-url:8089"
+    splunk_username = "user"
+    splunk_password = "pass"
+    
+    session_key = splunk_login(splunk_url, splunk_username, splunk_password)
+    if session_key:
+        job_id = start_splunk_search(
+            splunk_url, session_key, 
+            search_query='search index="main" sourcetype="my_sourcetype"', 
+            earliest_time="-1h", 
+            latest_time="now"
+        )
+        if job_id:
+            splunk_results = get_splunk_search_results(splunk_url, session_key, job_id)
+            if splunk_results:
+                insert_data_to_sqlite("splunk_results", splunk_results, application_name, release_id, run_id, date_of_execution)
+
+if __name__ == "__main__":
+    main()
